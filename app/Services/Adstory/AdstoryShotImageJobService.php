@@ -15,7 +15,7 @@ use Throwable;
 
 class AdstoryShotImageJobService
 {
-    public const QUEUE_NAME = 'adstory-shot-images';
+    public const QUEUE_NAME = 'adstory-ai';
 
     public const JOB_TIMEOUT_SECONDS = 300;
 

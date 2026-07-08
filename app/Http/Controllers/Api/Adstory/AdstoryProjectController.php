@@ -12,6 +12,7 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Validation\ValidationException;
 use Throwable;
+use App\Support\ApiErrorResponder;
 
 class AdstoryProjectController extends Controller
 {
@@ -301,17 +302,16 @@ class AdstoryProjectController extends Controller
 
     private function validationErrorResponse(ValidationException $e): JsonResponse
     {
-        return response()->json([
-            'success' => false,
-            'message' => $e->validator->errors()->first(),
-        ], 422);
+        return ApiErrorResponder::error(
+            message: $e->validator->errors()->first(),
+            status: 422,
+            code: 'validation_failed',
+            extra: ['errors' => $e->errors()],
+        );
     }
 
     private function unexpectedErrorResponse(string $message): JsonResponse
     {
-        return response()->json([
-            'success' => false,
-            'message' => $message,
-        ], 500);
+        return ApiErrorResponder::error($message, 500, 'unexpected_error');
     }
 }

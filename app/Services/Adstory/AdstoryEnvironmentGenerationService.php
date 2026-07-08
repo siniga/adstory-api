@@ -46,14 +46,11 @@ class AdstoryEnvironmentGenerationService
         $this->assertScreenplayOrScenes($project);
 
         if ($project->environments()->exists()) {
-            Log::info('Adstory environment-generation: skipped — environments already exist', [
+            Log::info('Adstory environment-generation: environments exist, queueing image tasks', [
                 'project_id' => $project->id,
             ]);
 
-            return array_merge(
-                $this->buildProgressPayload($project),
-                ['started' => false],
-            );
+            return $this->startImageGeneration($project, $style);
         }
 
         if (AdstoryAiTask::query()

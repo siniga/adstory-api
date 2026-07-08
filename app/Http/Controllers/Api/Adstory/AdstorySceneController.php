@@ -13,6 +13,7 @@ use Illuminate\Support\Facades\Log;
 use Illuminate\Validation\ValidationException;
 use RuntimeException;
 use Throwable;
+use App\Support\ApiErrorResponder;
 
 class AdstorySceneController extends Controller
 {
@@ -66,7 +67,10 @@ class AdstorySceneController extends Controller
         } catch (ValidationException $e) {
             return $this->validationErrorResponse($e);
         } catch (Throwable $e) {
-            return $this->unexpectedErrorResponse('An unexpected error occurred while starting scene generation.');
+            return ApiErrorResponder::fromThrowable(
+                $e,
+                'We could not start scene generation right now. Please try again in a few minutes.'
+            );
         }
     }
 
@@ -473,25 +477,21 @@ class AdstorySceneController extends Controller
 
     private function validationErrorResponse(ValidationException $e): JsonResponse
     {
-        return response()->json([
-            'success' => false,
-            'message' => $e->validator->errors()->first(),
-        ], 422);
+        return ApiErrorResponder::error(
+            message: $e->validator->errors()->first(),
+            status: 422,
+            code: 'validation_failed',
+            extra: ['errors' => $e->errors()],
+        );
     }
 
     private function notFoundResponse(string $message): JsonResponse
     {
-        return response()->json([
-            'success' => false,
-            'message' => $message,
-        ], 404);
+        return ApiErrorResponder::error($message, 404, 'not_found');
     }
 
     private function unexpectedErrorResponse(string $message): JsonResponse
     {
-        return response()->json([
-            'success' => false,
-            'message' => $message,
-        ], 500);
+        return ApiErrorResponder::error($message, 500, 'unexpected_error');
     }
 }

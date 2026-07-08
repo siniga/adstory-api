@@ -22,6 +22,7 @@ use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
 use RuntimeException;
 use Throwable;
+use App\Support\ApiErrorResponder;
 
 class StoryGenerationController extends Controller
 {
@@ -88,10 +89,10 @@ class StoryGenerationController extends Controller
                 'message' => $e->getMessage(),
             ], $status);
         } catch (Throwable $e) {
-            return response()->json([
-                'success' => false,
-                'message' => 'An unexpected error occurred while generating the script.',
-            ], 500);
+            return ApiErrorResponder::fromThrowable(
+                $e,
+                'We could not generate the script right now. Please try again in a moment.'
+            );
         }
     }
 
@@ -145,10 +146,10 @@ class StoryGenerationController extends Controller
                 'message' => $e->getMessage(),
             ], $status);
         } catch (Throwable $e) {
-            return response()->json([
-                'success' => false,
-                'message' => 'An unexpected error occurred while generating the screenplay.',
-            ], 500);
+            return ApiErrorResponder::fromThrowable(
+                $e,
+                'We could not generate the screenplay right now. Please try again in a moment.'
+            );
         }
     }
 
@@ -219,10 +220,10 @@ class StoryGenerationController extends Controller
                 'message' => $e->getMessage(),
             ], $status);
         } catch (Throwable $e) {
-            return response()->json([
-                'success' => false,
-                'message' => 'An unexpected error occurred while generating the scenes.',
-            ], 500);
+            return ApiErrorResponder::fromThrowable(
+                $e,
+                'We could not generate scenes right now. Please try again in a moment.'
+            );
         }
     }
 
@@ -284,10 +285,10 @@ class StoryGenerationController extends Controller
                 'message' => $e->getMessage(),
             ], $status);
         } catch (Throwable $e) {
-            return response()->json([
-                'success' => false,
-                'message' => 'An unexpected error occurred while generating the shots.',
-            ], 500);
+            return ApiErrorResponder::fromThrowable(
+                $e,
+                'We could not generate shots right now. Please try again in a moment.'
+            );
         }
     }
 
@@ -342,10 +343,10 @@ class StoryGenerationController extends Controller
                 'message' => $e->getMessage(),
             ], $status);
         } catch (Throwable $e) {
-            return response()->json([
-                'success' => false,
-                'message' => 'An unexpected error occurred while extracting characters.',
-            ], 500);
+            return ApiErrorResponder::fromThrowable(
+                $e,
+                'We could not extract characters right now. Please try again in a moment.'
+            );
         }
     }
 
@@ -400,10 +401,10 @@ class StoryGenerationController extends Controller
                 'message' => $e->getMessage(),
             ], $status);
         } catch (Throwable $e) {
-            return response()->json([
-                'success' => false,
-                'message' => 'An unexpected error occurred while extracting environments.',
-            ], 500);
+            return ApiErrorResponder::fromThrowable(
+                $e,
+                'We could not extract environments right now. Please try again in a moment.'
+            );
         }
     }
 
@@ -528,10 +529,10 @@ class StoryGenerationController extends Controller
                 'message' => $e->getMessage(),
             ], $status);
         } catch (Throwable $e) {
-            return response()->json([
-                'success' => false,
-                'message' => 'An unexpected error occurred while generating the character image.',
-            ], 500);
+            return ApiErrorResponder::fromThrowable(
+                $e,
+                'We could not generate the character image right now. Please try again in a moment.'
+            );
         }
     }
 
@@ -647,10 +648,10 @@ class StoryGenerationController extends Controller
                 'message' => $e->getMessage(),
             ], $status);
         } catch (Throwable $e) {
-            return response()->json([
-                'success' => false,
-                'message' => 'An unexpected error occurred while generating the character reference.',
-            ], 500);
+            return ApiErrorResponder::fromThrowable(
+                $e,
+                'We could not generate the reference image right now. Please try again in a moment.'
+            );
         }
     }
 
@@ -773,10 +774,10 @@ class StoryGenerationController extends Controller
                 'message' => $e->getMessage(),
             ], $status);
         } catch (Throwable $e) {
-            return response()->json([
-                'success' => false,
-                'message' => 'An unexpected error occurred while generating the environment image.',
-            ], 500);
+            return ApiErrorResponder::fromThrowable(
+                $e,
+                'We could not generate the environment image right now. Please try again in a moment.'
+            );
         }
     }
 
