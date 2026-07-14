@@ -697,7 +697,19 @@ class AdstorySceneGenerationService
             return self::PROJECT_STATUS_RUNNING;
         }
 
-        return $stored;
+        // Empty "running" with no scenes/tasks is a zombie — clear it back to idle.
+        if ($total <= 0 && in_array($stored, [self::PROJECT_STATUS_RUNNING, self::PROJECT_STATUS_RESTARTING], true)) {
+            $project->update([
+                'scene_generation_status' => self::PROJECT_STATUS_IDLE,
+                'scene_generation_finished_at' => now(),
+            ]);
+
+            return self::PROJECT_STATUS_IDLE;
+        }
+
+        return $stored === self::PROJECT_STATUS_RUNNING
+            ? self::PROJECT_STATUS_IDLE
+            : $stored;
     }
 
     private function buildScenePlanPrompt(string $screenplay, ?string $style): string

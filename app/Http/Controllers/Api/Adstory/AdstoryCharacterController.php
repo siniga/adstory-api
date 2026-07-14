@@ -136,6 +136,26 @@ class AdstoryCharacterController extends Controller
         }
     }
 
+    public function cancelGeneration(AdstoryProject $project): JsonResponse
+    {
+        try {
+            $progress = $this->characterGenerationService->cancelGeneration($project);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Character generation cancelled.',
+                'progress' => $progress,
+            ]);
+        } catch (RuntimeException $e) {
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 422);
+        } catch (Throwable $e) {
+            return $this->unexpectedErrorResponse('An unexpected error occurred while cancelling character generation.');
+        }
+    }
+
     public function store(Request $request, AdstoryProject $project): JsonResponse
     {
         try {

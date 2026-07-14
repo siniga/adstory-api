@@ -32,6 +32,8 @@ class AdstoryEnvironmentGenerationService
 
     public const PROJECT_STATUS_FAILED = 'failed';
 
+    public const PROJECT_STATUS_CANCELLED = 'cancelled';
+
     public function __construct(
         private readonly AdstoryAiTaskService $aiTaskService,
     ) {}
@@ -329,6 +331,35 @@ class AdstoryEnvironmentGenerationService
     /**
      * @return array<string, mixed>
      */
+    public function cancelGeneration(AdstoryProject $project): array
+    {
+        if (! in_array($project->environment_generation_status, [
+            self::PROJECT_STATUS_RUNNING,
+        ], true)) {
+            throw new RuntimeException('No active environment generation to cancel.');
+        }
+
+        $cancelledCount = $this->aiTaskService->cancelQueuedTasksByTypes($project->id, [
+            AdstoryAiTask::TYPE_EXTRACT_ENVIRONMENTS,
+            AdstoryAiTask::TYPE_GENERATE_ENVIRONMENT_IMAGE,
+        ]);
+
+        $project->update([
+            'environment_generation_status' => self::PROJECT_STATUS_CANCELLED,
+            'environment_generation_finished_at' => now(),
+        ]);
+
+        Log::info('Adstory environment-generation: cancelled', [
+            'project_id' => $project->id,
+            'cancelled_tasks' => $cancelledCount,
+        ]);
+
+        return $this->buildProgressPayload($project->fresh());
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
     public function resumeGeneration(AdstoryProject $project, bool $retryFailed = false, ?string $style = null): array
     {
         $staleReset = $this->aiTaskService->resetStaleRunningTasks(
@@ -350,6 +381,16 @@ class AdstoryEnvironmentGenerationService
         }
 
         $created = $this->ensureMissingImageTasks($project, $style);
+
+        if (
+            $created > 0 ||
+            $project->environment_generation_status === self::PROJECT_STATUS_CANCELLED
+        ) {
+            $project->update([
+                'environment_generation_status' => self::PROJECT_STATUS_RUNNING,
+                'environment_generation_finished_at' => null,
+            ]);
+        }
 
         Log::info('Adstory environment-generation: resume dispatched', [
             'project_id' => $project->id,

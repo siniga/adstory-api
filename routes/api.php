@@ -99,6 +99,7 @@ Route::get('/adstory/projects/{project}/characters', [AdstoryCharacterController
 Route::get('/adstory/projects/{project}/characters/progress', [AdstoryCharacterController::class, 'progress']);
 Route::post('/adstory/projects/{project}/characters/start-generation', [AdstoryCharacterController::class, 'startGeneration']);
 Route::post('/adstory/projects/{project}/characters/resume-generation', [AdstoryCharacterController::class, 'resumeGeneration']);
+Route::post('/adstory/projects/{project}/characters/cancel-generation', [AdstoryCharacterController::class, 'cancelGeneration']);
 Route::post('/adstory/projects/{project}/characters/start-extraction', [AdstoryCharacterController::class, 'startExtraction']);
 Route::post('/adstory/projects/{project}/characters/start-image-generation', [AdstoryCharacterController::class, 'startImageGeneration']);
 Route::put('/adstory/projects/{project}/characters/bulk', [AdstoryCharacterController::class, 'bulkReplace']);
@@ -112,6 +113,7 @@ Route::post('/adstory/projects/{project}/environments/start-generation', [Adstor
 Route::post('/adstory/projects/{project}/environments/start-image-generation', [AdstoryEnvironmentController::class, 'startImageGeneration']);
 Route::post('/adstory/projects/{project}/environments/regenerate-images', [AdstoryEnvironmentController::class, 'regenerateAllImages']);
 Route::post('/adstory/projects/{project}/environments/resume-generation', [AdstoryEnvironmentController::class, 'resumeGeneration']);
+Route::post('/adstory/projects/{project}/environments/cancel-generation', [AdstoryEnvironmentController::class, 'cancelGeneration']);
 Route::post('/adstory/projects/{project}/environments/start-extraction', [AdstoryEnvironmentController::class, 'startExtraction']);
 Route::post('/adstory/projects/{project}/environments/{environment}/regenerate-image', [AdstoryEnvironmentController::class, 'regenerateImage']);
 Route::post('/adstory/projects/{project}/environments/{environment}/retry', [AdstoryEnvironmentController::class, 'retry']);

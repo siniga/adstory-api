@@ -394,9 +394,21 @@ class AdstoryAiTaskService
 
     public function cancelQueuedSceneTasks(int $projectId): int
     {
+        return $this->cancelQueuedTasksByTypes($projectId, [AdstoryAiTask::TYPE_GENERATE_SCENE]);
+    }
+
+    /**
+     * @param  list<string>  $types
+     */
+    public function cancelQueuedTasksByTypes(int $projectId, array $types): int
+    {
+        if ($types === []) {
+            return 0;
+        }
+
         $count = AdstoryAiTask::query()
             ->where('adstory_project_id', $projectId)
-            ->where('type', AdstoryAiTask::TYPE_GENERATE_SCENE)
+            ->whereIn('type', $types)
             ->where('status', AdstoryAiTask::STATUS_QUEUED)
             ->update([
                 'status' => AdstoryAiTask::STATUS_CANCELLED,
@@ -406,6 +418,7 @@ class AdstoryAiTaskService
 
         Log::info('Adstory AI task: queued tasks cancelled', [
             'project_id' => $projectId,
+            'types' => $types,
             'count' => $count,
         ]);
 

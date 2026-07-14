@@ -30,6 +30,8 @@ class AdstoryCharacterGenerationService
 
     public const PROJECT_STATUS_FAILED = 'failed';
 
+    public const PROJECT_STATUS_CANCELLED = 'cancelled';
+
     public function __construct(
         private readonly AdstoryAiTaskService $aiTaskService,
     ) {}
@@ -201,6 +203,35 @@ class AdstoryCharacterGenerationService
     /**
      * @return array<string, mixed>
      */
+    /**
+     * @return array<string, mixed>
+     */
+    public function cancelGeneration(AdstoryProject $project): array
+    {
+        if (! in_array($project->character_generation_status, [
+            self::PROJECT_STATUS_RUNNING,
+        ], true)) {
+            throw new RuntimeException('No active character generation to cancel.');
+        }
+
+        $cancelledCount = $this->aiTaskService->cancelQueuedTasksByTypes($project->id, [
+            AdstoryAiTask::TYPE_EXTRACT_CHARACTERS,
+            AdstoryAiTask::TYPE_GENERATE_CHARACTER_IMAGE,
+        ]);
+
+        $project->update([
+            'character_generation_status' => self::PROJECT_STATUS_CANCELLED,
+            'character_generation_finished_at' => now(),
+        ]);
+
+        Log::info('Adstory character-generation: cancelled', [
+            'project_id' => $project->id,
+            'cancelled_tasks' => $cancelledCount,
+        ]);
+
+        return $this->buildProgressPayload($project->fresh());
+    }
+
     public function resumeGeneration(AdstoryProject $project, bool $retryFailed = false, ?string $style = null): array
     {
         $staleReset = $this->aiTaskService->resetStaleRunningTasks(
@@ -223,7 +254,10 @@ class AdstoryCharacterGenerationService
 
         $created = $this->ensureMissingImageTasks($project, $style);
 
-        if ($created > 0) {
+        if (
+            $created > 0 ||
+            $project->character_generation_status === self::PROJECT_STATUS_CANCELLED
+        ) {
             $project->update([
                 'character_generation_status' => self::PROJECT_STATUS_RUNNING,
                 'character_generation_finished_at' => null,

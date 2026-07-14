@@ -196,6 +196,26 @@ class AdstoryEnvironmentController extends Controller
         }
     }
 
+    public function cancelGeneration(AdstoryProject $project): JsonResponse
+    {
+        try {
+            $progress = $this->environmentGenerationService->cancelGeneration($project);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Environment generation cancelled.',
+                'progress' => $progress,
+            ]);
+        } catch (RuntimeException $e) {
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 422);
+        } catch (Throwable $e) {
+            return $this->unexpectedErrorResponse('An unexpected error occurred while cancelling environment generation.');
+        }
+    }
+
     public function retry(Request $request, AdstoryProject $project, AdstoryEnvironment $environment): JsonResponse
     {
         if (! $this->environmentBelongsToProject($environment, $project)) {
