@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api\Adstory;
 
 use App\Http\Controllers\Controller;
 use App\Models\AdstoryProject;
+use App\Services\Adstory\AdstoryProjectCoverService;
 use App\Services\Adstory\AdstoryProjectDeletionService;
 use App\Services\Adstory\AdstoryProjectFullLoaderService;
 use App\Services\Adstory\AdstorySceneGenerationService;
@@ -20,6 +21,7 @@ class AdstoryProjectController extends Controller
         private readonly AdstoryProjectDeletionService $projectDeletionService,
         private readonly AdstorySceneGenerationService $sceneGenerationService,
         private readonly AdstoryProjectFullLoaderService $fullLoaderService,
+        private readonly AdstoryProjectCoverService $projectCoverService,
     ) {}
 
     public function index(): JsonResponse
@@ -29,6 +31,7 @@ class AdstoryProjectController extends Controller
                 'id',
                 'title',
                 'visual_style',
+                'cover_image_url',
                 'current_step',
                 'status',
                 'scene_generation_status',
@@ -206,6 +209,38 @@ class AdstoryProjectController extends Controller
             return $this->validationErrorResponse($e);
         } catch (Throwable $e) {
             return $this->unexpectedErrorResponse('An unexpected error occurred while saving the project.');
+        }
+    }
+
+    public function generateCover(Request $request, AdstoryProject $project): JsonResponse
+    {
+        try {
+            $validated = $request->validate([
+                'force' => 'sometimes|boolean',
+            ]);
+
+            $result = $this->projectCoverService->ensureCoverImage(
+                project: $project,
+                force: (bool) ($validated['force'] ?? false),
+            );
+
+            return response()->json([
+                'success' => true,
+                'generated' => $result['generated'],
+                'skipped' => $result['skipped'],
+                'cover_image_url' => $result['cover_image_url'],
+                'project' => $project->fresh()->toApiArray(),
+                'message' => $result['skipped']
+                    ? 'Project cover already exists.'
+                    : 'Project cover generated successfully.',
+            ], $result['generated'] ? 201 : 200);
+        } catch (ValidationException $e) {
+            return $this->validationErrorResponse($e);
+        } catch (Throwable $e) {
+            return ApiErrorResponder::fromThrowable(
+                $e,
+                'We could not generate a project cover right now. Please try again in a moment.'
+            );
         }
     }
 

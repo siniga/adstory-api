@@ -67,7 +67,10 @@ class AdstoryShotImageJobService
     }
 
     /**
-     * @return int Number of jobs queued
+     * Mark scene shots as queued and start only the first job.
+     * Later shots run one-by-one via {@see continueSceneImageChain} for previous-frame continuity.
+     *
+     * @return int Number of shots marked queued
      */
     public function queueShotImageJobsForScene(
         AdstoryProject $project,
@@ -75,19 +78,38 @@ class AdstoryShotImageJobService
         bool $force = false,
         ?string $customPrompt = null,
     ): int {
-        $queued = 0;
-
         $shots = AdstoryShot::query()
             ->where('adstory_project_id', $project->id)
             ->where('adstory_scene_id', $scene->id)
             ->orderBy('order_index')
+            ->orderBy('shot_number')
             ->orderBy('id')
             ->get();
 
-        foreach ($shots as $shot) {
-            if ($this->queueShotImageJob($shot, $customPrompt, $force)) {
-                $queued++;
-            }
+        return $this->enqueueOrderedSceneShots($shots, $force, $customPrompt);
+    }
+
+    /**
+     * Queue shots grouped by scene, one active job per scene.
+     *
+     * @param  Collection<int, AdstoryShot>  $shots
+     * @return int Number of shots marked queued
+     */
+    public function queueShotImageJobsSequential(Collection $shots, bool $force = false): int
+    {
+        $queued = 0;
+
+        $grouped = $shots
+            ->sortBy([
+                ['adstory_scene_id', 'asc'],
+                ['order_index', 'asc'],
+                ['shot_number', 'asc'],
+                ['id', 'asc'],
+            ])
+            ->groupBy(fn (AdstoryShot $shot) => $shot->adstory_scene_id ?? 'none');
+
+        foreach ($grouped as $sceneShots) {
+            $queued += $this->enqueueOrderedSceneShots($sceneShots->values(), $force);
         }
 
         return $queued;
@@ -155,7 +177,9 @@ class AdstoryShotImageJobService
     }
 
     /**
-     * @return int Number of jobs queued for incomplete shots
+     * Mark incomplete shots as queued and ensure one sequential chain per scene is running.
+     *
+     * @return int Number of shots newly marked queued
      */
     public function ensureMissingShotImageJobs(
         AdstoryProject $project,
@@ -165,33 +189,127 @@ class AdstoryShotImageJobService
         $query = AdstoryShot::query()
             ->where('adstory_project_id', $project->id)
             ->orderBy('order_index')
+            ->orderBy('shot_number')
             ->orderBy('id');
 
         if ($scene !== null) {
             $query->where('adstory_scene_id', $scene->id);
         }
 
+        $shots = $query->get();
         $queued = 0;
 
-        foreach ($query->get() as $shot) {
-            if ($this->shotHasCompletedImage($shot)) {
-                continue;
-            }
+        $grouped = $shots->groupBy(fn (AdstoryShot $shot) => $shot->adstory_scene_id ?? 'none');
 
-            if (! $includeFailed && $shot->image_status === self::STATUS_FAILED) {
-                continue;
-            }
+        foreach ($grouped as $sceneKey => $sceneShots) {
+            foreach ($sceneShots as $shot) {
+                if ($this->shotHasCompletedImage($shot)) {
+                    continue;
+                }
 
-            if ($this->shotIsInFlight($shot)) {
-                continue;
-            }
+                if (! $includeFailed && $shot->image_status === self::STATUS_FAILED) {
+                    continue;
+                }
 
-            if ($this->queueShotImageJob($shot)) {
+                if ($this->shotIsInFlight($shot)) {
+                    continue;
+                }
+
+                $shot->markStoryboardImageQueued();
                 $queued++;
+
+                Log::info('Queued Shot '.$shot->id.' (ensure missing)', [
+                    'shot_id' => $shot->id,
+                    'project_id' => $project->id,
+                    'scene_id' => $shot->adstory_scene_id,
+                ]);
+            }
+
+            $sceneId = is_numeric($sceneKey) ? (int) $sceneKey : null;
+
+            if (! $this->sceneHasGeneratingShot($sceneId, $project->id)) {
+                $this->dispatchNextQueuedShotInScene(
+                    sceneId: $sceneId,
+                    projectId: $project->id,
+                );
             }
         }
 
         return $queued;
+    }
+
+    /**
+     * After a shot finishes, dispatch the next queued shot in the same scene (if any).
+     */
+    public function continueSceneImageChain(
+        ?int $sceneId,
+        ?int $projectId = null,
+        ?string $customPrompt = null,
+        bool $force = false,
+    ): void {
+        if ($this->sceneHasGeneratingShot($sceneId, $projectId)) {
+            Log::info('Scene image chain waiting (shot still generating)', [
+                'scene_id' => $sceneId,
+                'project_id' => $projectId,
+            ]);
+
+            return;
+        }
+
+        $dispatched = $this->dispatchNextQueuedShotInScene(
+            sceneId: $sceneId,
+            projectId: $projectId,
+            customPrompt: $customPrompt,
+            force: $force,
+        );
+
+        if (! $dispatched) {
+            Log::info('Scene image chain finished (no queued shots left)', [
+                'scene_id' => $sceneId,
+                'project_id' => $projectId,
+            ]);
+        }
+    }
+
+    /**
+     * If shots are queued but nothing is generating / in the jobs table, start the next one.
+     * Safe to call from progress polling — unique jobs prevent duplicate workers.
+     */
+    public function kickStalledSceneImageChain(?int $sceneId, ?int $projectId = null): bool
+    {
+        if ($sceneId === null && $projectId === null) {
+            return false;
+        }
+
+        if ($this->sceneHasGeneratingShot($sceneId, $projectId)) {
+            return false;
+        }
+
+        $query = AdstoryShot::query()->where('image_status', self::STATUS_QUEUED);
+
+        if ($sceneId === null) {
+            $query->whereNull('adstory_scene_id');
+        } else {
+            $query->where('adstory_scene_id', $sceneId);
+        }
+
+        if ($projectId !== null) {
+            $query->where('adstory_project_id', $projectId);
+        }
+
+        if (! $query->exists()) {
+            return false;
+        }
+
+        Log::info('Kicking stalled scene image chain', [
+            'scene_id' => $sceneId,
+            'project_id' => $projectId,
+        ]);
+
+        return $this->dispatchNextQueuedShotInScene(
+            sceneId: $sceneId,
+            projectId: $projectId,
+        );
     }
 
     public function executeShotImageGeneration(
@@ -205,91 +323,145 @@ class AdstoryShotImageJobService
             throw new RuntimeException('Shot no longer exists.');
         }
 
-        if (! $force && $this->shotHasCompletedImage($shot)) {
-            Log::info('Completed Shot '.$shot->id.' (already done, skipped)', [
-                'shot_id' => $shot->id,
-            ]);
-
-            return;
-        }
-
-        if ($shot->image_status === self::STATUS_PENDING) {
-            Log::info('Skipped Shot '.$shot->id.' (cancelled before start)', [
-                'shot_id' => $shot->id,
-            ]);
-
-            return;
-        }
-
-        Log::info('Started Shot '.$shot->id, [
-            'shot_id' => $shot->id,
-            'project_id' => $shot->adstory_project_id,
-            'scene_id' => $shot->adstory_scene_id,
-        ]);
+        $continueChain = true;
 
         try {
-            $project = AdstoryProject::query()
-                ->with(['characters', 'environments'])
-                ->find($shot->adstory_project_id);
+            if (! $force && $this->shotHasCompletedImage($shot)) {
+                Log::info('Completed Shot '.$shot->id.' (already done, skipped)', [
+                    'shot_id' => $shot->id,
+                ]);
 
-            if (! $project) {
-                throw new RuntimeException('Project no longer exists.');
+                return;
             }
 
-            $shot->markStoryboardImageGenerating();
-            $shot->update(['image_progress' => 15]);
+            if ($shot->image_status === self::STATUS_PENDING) {
+                Log::info('Skipped Shot '.$shot->id.' (cancelled before start)', [
+                    'shot_id' => $shot->id,
+                ]);
 
-            $shot->load('scene');
-            $scene = $shot->scene;
-
-            $characters = $this->shotImageService->resolveCharactersForShot($shot, $project);
-            $environment = $this->shotImageService->resolveEnvironmentForShot($shot, $scene, $project);
-
-            $promptResult = $this->shotImageService->buildShotImagePrompt(
-                shot: $shot,
-                scene: $scene,
-                project: $project,
-                characters: $characters,
-                environment: $environment,
-                customPrompt: $customPrompt,
-            );
-
-            $imagePrompt = $promptResult['prompt'];
-            $shot->update(['image_prompt' => $imagePrompt, 'image_progress' => 30]);
-
-            $imageBase64 = $this->geminiService->generateImage($imagePrompt);
-            $shot->update(['image_progress' => 70]);
-
-            $imageData = base64_decode($imageBase64, true);
-
-            if ($imageData === false) {
-                throw new RuntimeException('Gemini image generation failed: invalid base64 image data.');
+                return;
             }
 
-            $this->assertUsableImageData($imageData);
-
-            $sceneId = $shot->adstory_scene_id ?? 'unknown';
-            $storageSuffix = uniqid('storyboard_', true);
-            $storagePath = "adstory/projects/{$project->id}/storyboard/scenes/{$sceneId}/shots/{$shot->id}/{$storageSuffix}.png";
-            Storage::disk('public')->put($storagePath, $imageData);
-            $imageUrl = $this->contentService->publicStorageUrl($storagePath);
-
-            $shot->markStoryboardImageCompleted($imageUrl, $imagePrompt);
-
-            Log::info('Completed Shot '.$shot->id, [
+            Log::info('Started Shot '.$shot->id, [
                 'shot_id' => $shot->id,
-                'project_id' => $project->id,
-                'image_url' => $imageUrl,
-            ]);
-        } catch (Throwable $e) {
-            $shot->markStoryboardImageFailed($e->getMessage());
-
-            Log::error('Failed Shot '.$shot->id, [
-                'shot_id' => $shot->id,
-                'message' => $e->getMessage(),
+                'project_id' => $shot->adstory_project_id,
+                'scene_id' => $shot->adstory_scene_id,
             ]);
 
-            throw $e;
+            try {
+                $project = AdstoryProject::query()
+                    ->with(['characters', 'environments'])
+                    ->find($shot->adstory_project_id);
+
+                if (! $project) {
+                    throw new RuntimeException('Project no longer exists.');
+                }
+
+                $shot->markStoryboardImageGenerating();
+                $shot->update(['image_progress' => 15]);
+
+                $shot->load('scene');
+                $scene = $shot->scene;
+
+                $characters = $this->shotImageService->resolveCharactersForShot($shot, $project);
+                $environment = $this->shotImageService->resolveEnvironmentForShot($shot, $scene, $project);
+                $previousShot = $this->shotImageService->findPreviousCompletedShotInScene($shot);
+
+                $promptResult = $this->shotImageService->buildShotImagePrompt(
+                    shot: $shot,
+                    scene: $scene,
+                    project: $project,
+                    characters: $characters,
+                    environment: $environment,
+                    customPrompt: $customPrompt,
+                    previousShot: $previousShot,
+                );
+
+                $imagePrompt = $promptResult['prompt'];
+                $referenceImages = $promptResult['reference_images'] ?? [];
+                $shot->update(['image_prompt' => $imagePrompt, 'image_progress' => 30]);
+
+                Log::info('Shot image prompt prepared', [
+                    'shot_id' => $shot->id,
+                    'reference_image_count' => count($referenceImages),
+                    'previous_shot_id' => $previousShot?->id,
+                    'included' => $promptResult['included'] ?? [],
+                ]);
+
+                $imageBase64 = $this->geminiService->generateImage(
+                    $imagePrompt,
+                    null,
+                    $referenceImages,
+                );
+                $shot->update(['image_progress' => 70]);
+
+                $imageData = base64_decode($imageBase64, true);
+
+                if ($imageData === false) {
+                    throw new RuntimeException('Gemini image generation failed: invalid base64 image data.');
+                }
+
+                $this->assertUsableImageData($imageData);
+
+                $sceneId = $shot->adstory_scene_id ?? 'unknown';
+                $storageSuffix = uniqid('storyboard_', true);
+                $storagePath = "adstory/projects/{$project->id}/storyboard/scenes/{$sceneId}/shots/{$shot->id}/{$storageSuffix}.png";
+                Storage::disk('public')->put($storagePath, $imageData);
+                $imageUrl = $this->contentService->publicStorageUrl($storagePath);
+
+                $shot->markStoryboardImageCompleted($imageUrl, $imagePrompt);
+
+                Log::info('Completed Shot '.$shot->id, [
+                    'shot_id' => $shot->id,
+                    'project_id' => $project->id,
+                    'image_url' => $imageUrl,
+                ]);
+
+                // Chain immediately after success so remaining queued shots keep moving.
+                try {
+                    $this->continueSceneImageChain(
+                        sceneId: $shot->adstory_scene_id,
+                        projectId: $shot->adstory_project_id,
+                        customPrompt: $customPrompt,
+                        force: $force,
+                    );
+                    $continueChain = false;
+                } catch (Throwable $chainError) {
+                    Log::error('Scene image chain continue failed after success', [
+                        'shot_id' => $shot->id,
+                        'scene_id' => $shot->adstory_scene_id,
+                        'message' => $chainError->getMessage(),
+                    ]);
+                }
+            } catch (Throwable $e) {
+                // Keep the chain paused while Laravel retries this job.
+                $continueChain = false;
+                $shot->markStoryboardImageFailed($e->getMessage());
+
+                Log::error('Failed Shot '.$shot->id, [
+                    'shot_id' => $shot->id,
+                    'message' => $e->getMessage(),
+                ]);
+
+                throw $e;
+            }
+        } finally {
+            if ($continueChain) {
+                try {
+                    $this->continueSceneImageChain(
+                        sceneId: $shot->adstory_scene_id,
+                        projectId: $shot->adstory_project_id,
+                        customPrompt: $customPrompt,
+                        force: $force,
+                    );
+                } catch (Throwable $chainError) {
+                    Log::error('Scene image chain continue failed in finally', [
+                        'shot_id' => $shot->id,
+                        'scene_id' => $shot->adstory_scene_id,
+                        'message' => $chainError->getMessage(),
+                    ]);
+                }
+            }
         }
     }
 
@@ -304,6 +476,12 @@ class AdstoryShotImageJobService
         if ($shot->image_status !== self::STATUS_FAILED) {
             $shot->markStoryboardImageFailed($error);
         }
+
+        // Final failure (retries exhausted) — continue remaining queued shots in the scene.
+        $this->continueSceneImageChain(
+            sceneId: $shot->adstory_scene_id,
+            projectId: $shot->adstory_project_id,
+        );
     }
 
     /**
@@ -347,6 +525,119 @@ class AdstoryShotImageJobService
     public function shotIsInFlight(AdstoryShot $shot): bool
     {
         return in_array($shot->image_status, [self::STATUS_QUEUED, self::STATUS_GENERATING], true);
+    }
+
+    /**
+     * Mark eligible shots as queued; dispatch only the first when nothing is already generating.
+     *
+     * @param  Collection<int, AdstoryShot>  $shots
+     * @return int Number of shots newly marked queued
+     */
+    private function enqueueOrderedSceneShots(
+        Collection $shots,
+        bool $force = false,
+        ?string $customPrompt = null,
+    ): int {
+        if ($shots->isEmpty()) {
+            return 0;
+        }
+
+        $projectId = (int) $shots->first()->adstory_project_id;
+        $sceneId = $shots->first()->adstory_scene_id;
+        $hadGenerating = $this->sceneHasGeneratingShot($sceneId, $projectId);
+        $queued = 0;
+
+        foreach ($shots as $shot) {
+            if (! $force && $this->shotHasCompletedImage($shot)) {
+                continue;
+            }
+
+            if (! $force && $this->shotIsInFlight($shot)) {
+                continue;
+            }
+
+            $shot->markStoryboardImageQueued();
+            $queued++;
+
+            Log::info('Queued Shot '.$shot->id.' (scene chain)', [
+                'shot_id' => $shot->id,
+                'project_id' => $shot->adstory_project_id,
+                'scene_id' => $shot->adstory_scene_id,
+            ]);
+        }
+
+        if ($queued === 0) {
+            return 0;
+        }
+
+        if (! $hadGenerating) {
+            $this->dispatchNextQueuedShotInScene(
+                sceneId: $sceneId,
+                projectId: $projectId,
+                customPrompt: $customPrompt,
+                force: $force,
+            );
+        }
+
+        return $queued;
+    }
+
+    private function sceneHasGeneratingShot(?int $sceneId, ?int $projectId = null): bool
+    {
+        $query = AdstoryShot::query()
+            ->where('image_status', self::STATUS_GENERATING);
+
+        if ($sceneId === null) {
+            $query->whereNull('adstory_scene_id');
+        } else {
+            $query->where('adstory_scene_id', $sceneId);
+        }
+
+        if ($projectId !== null) {
+            $query->where('adstory_project_id', $projectId);
+        }
+
+        return $query->exists();
+    }
+
+    private function dispatchNextQueuedShotInScene(
+        ?int $sceneId,
+        ?int $projectId = null,
+        ?string $customPrompt = null,
+        bool $force = false,
+    ): bool {
+        $query = AdstoryShot::query()
+            ->where('image_status', self::STATUS_QUEUED)
+            ->orderBy('order_index')
+            ->orderBy('shot_number')
+            ->orderBy('id');
+
+        if ($sceneId === null) {
+            $query->whereNull('adstory_scene_id');
+        } else {
+            $query->where('adstory_scene_id', $sceneId);
+        }
+
+        if ($projectId !== null) {
+            $query->where('adstory_project_id', $projectId);
+        }
+
+        $next = $query->first();
+
+        if (! $next) {
+            return false;
+        }
+
+        Log::info('Chaining next shot image job', [
+            'shot_id' => $next->id,
+            'project_id' => $next->adstory_project_id,
+            'scene_id' => $next->adstory_scene_id,
+            'force' => $force,
+        ]);
+
+        GenerateShotImageJob::dispatch($next->id, $customPrompt, $force);
+
+        return true;
     }
 
     /**

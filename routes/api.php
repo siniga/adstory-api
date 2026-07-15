@@ -33,6 +33,7 @@ Route::put('/adstory/projects/{project}/story', [AdstoryProjectController::class
 Route::put('/adstory/projects/{project}/script', [AdstoryProjectController::class, 'updateScript']);
 Route::put('/adstory/projects/{project}/screenplay', [AdstoryProjectController::class, 'updateScreenplay']);
 Route::put('/adstory/projects/{project}/core', [AdstoryProjectController::class, 'updateCore']);
+Route::post('/adstory/projects/{project}/generate-cover', [AdstoryProjectController::class, 'generateCover']);
 
 Route::get('/adstory/projects/{project}/sceneboard', [AdstorySceneboardController::class, 'index']);
 

@@ -577,23 +577,79 @@ class AdstoryEnvironmentGenerationService
         $this->aiTaskService->resetStaleRunningTasks($project->id, AdstoryAiTask::TYPE_GENERATE_ENVIRONMENT_IMAGE);
         $this->resetStuckGeneratingEnvironments($project);
 
-        $environments = AdstoryEnvironment::query()
-            ->where('adstory_project_id', $project->id)
-            ->orderBy('order_index')
-            ->orderBy('id')
-            ->get();
+        $project->refresh()->load([
+            'environments' => fn ($query) => $query->orderBy('order_index')->orderBy('id'),
+        ]);
 
+        $environments = $project->environments->values();
         $extractCounts = $this->aiTaskService->getTaskCounts($project->id, AdstoryAiTask::TYPE_EXTRACT_ENVIRONMENTS);
+        $imageCounts = $this->aiTaskService->getTaskCounts($project->id, AdstoryAiTask::TYPE_GENERATE_ENVIRONMENT_IMAGE);
 
         if ($environments->isEmpty()) {
             $progress = $this->buildExtractionPhaseProgress($extractCounts);
         } else {
-            $progress = $this->buildImagePhaseProgress($environments);
+            $progress = $this->buildImagePhaseProgress($environments, $imageCounts);
         }
 
         $this->finalizeProjectIfDone($project, $environments);
+        $project->refresh();
+        $environments = $project->environments()->orderBy('order_index')->orderBy('id')->get()->values();
 
-        return array_merge(['success' => true], $progress);
+        $stall = $this->detectStalledState($project, $environments);
+
+        $status = $project->environment_generation_status ?? self::PROJECT_STATUS_IDLE;
+
+        $hasActiveImageWork =
+            (($imageCounts['queued'] ?? 0) + ($imageCounts['running'] ?? 0)) > 0
+            || ($progress['remaining'] ?? 0) > 0;
+
+        if (
+            $status === self::PROJECT_STATUS_IDLE
+            && $environments->isNotEmpty()
+            && $hasActiveImageWork
+        ) {
+            $status = self::PROJECT_STATUS_RUNNING;
+        }
+
+        if (
+            $status === self::PROJECT_STATUS_IDLE
+            && $environments->isNotEmpty()
+            && ($progress['completed'] ?? 0) === ($progress['total'] ?? 0)
+            && ($progress['total'] ?? 0) > 0
+            && $this->countEnvironmentsByImageStatus($environments, self::IMAGE_STATUS_PENDING) === 0
+        ) {
+            $status = self::PROJECT_STATUS_COMPLETED;
+        }
+
+        $environmentRows = $environments
+            ->map(fn (AdstoryEnvironment $environment) => $environment->toApiArray())
+            ->values()
+            ->all();
+
+        return array_merge($progress, [
+            'success' => true,
+            'project_id' => $project->id,
+            'status' => $status,
+            'stalled' => $stall['stalled'],
+            'queued_tasks' => $stall['queued_tasks'],
+            'running_tasks' => $stall['running_tasks'],
+            'missing_tasks' => $stall['missing_tasks'],
+            'failed_environments' => $this->buildFailedEnvironmentsList($environments),
+            'project' => $project->toApiArray(),
+            'environments' => $environmentRows,
+            'extraction' => [
+                'queued' => $extractCounts['queued'],
+                'running' => $extractCounts['running'],
+                'completed' => $extractCounts['completed'],
+                'failed' => $extractCounts['failed'],
+            ],
+            'tasks' => [
+                'queued' => $imageCounts['queued'],
+                'running' => $imageCounts['running'],
+                'completed' => $imageCounts['completed'],
+                'failed' => $imageCounts['failed'],
+            ],
+        ]);
     }
 
     /**
@@ -610,30 +666,45 @@ class AdstoryEnvironmentGenerationService
             'total' => 1,
             'completed' => $completed,
             'failed' => $failed,
+            'running' => $extractCounts['running'],
+            'queued' => $extractCounts['queued'],
             'remaining' => $remaining,
             'progress_percent' => $completed > 0 ? 100 : 0,
+            'estimated_remaining' => $remaining > 0 ? null : 0,
             'current_environment' => null,
+            'phase' => 'extraction',
         ];
     }
 
     /**
      * @param  Collection<int, AdstoryEnvironment>  $environments
+     * @param  array<string, int>  $imageCounts
      * @return array<string, mixed>
      */
-    private function buildImagePhaseProgress(Collection $environments): array
+    private function buildImagePhaseProgress(Collection $environments, array $imageCounts = []): array
     {
         $total = $environments->count();
         $completed = $this->countEnvironmentsByImageStatus($environments, self::IMAGE_STATUS_COMPLETED);
         $failed = $this->countEnvironmentsByImageStatus($environments, self::IMAGE_STATUS_FAILED);
+        $running = $this->countEnvironmentsByImageStatus($environments, self::IMAGE_STATUS_GENERATING);
+        $queued = $this->countEnvironmentsByImageStatus($environments, self::IMAGE_STATUS_QUEUED);
         $remaining = $environments->filter(
-            fn (AdstoryEnvironment $environment) => in_array(
+            fn (AdstoryEnvironment $environment) => ! in_array(
                 $this->resolveImageStatus($environment),
-                [self::IMAGE_STATUS_QUEUED, self::IMAGE_STATUS_GENERATING],
+                [self::IMAGE_STATUS_COMPLETED, self::IMAGE_STATUS_FAILED],
                 true
             )
         )->count();
 
-        $progressPercent = $total > 0 ? (int) round(($completed / $total) * 100) : 0;
+        if ($running === 0 && ($imageCounts['running'] ?? 0) > 0) {
+            $running = $imageCounts['running'];
+        }
+
+        if ($queued === 0 && ($imageCounts['queued'] ?? 0) > 0) {
+            $queued = $imageCounts['queued'];
+        }
+
+        $progressPercent = $total > 0 ? (int) round((($completed + $failed) / $total) * 100) : 0;
 
         $currentEnvironment = $environments->first(
             fn (AdstoryEnvironment $environment) => $this->resolveImageStatus($environment) === self::IMAGE_STATUS_GENERATING
@@ -647,11 +718,15 @@ class AdstoryEnvironmentGenerationService
             'total' => $total,
             'completed' => $completed,
             'failed' => $failed,
+            'running' => $running,
+            'queued' => $queued,
             'remaining' => $remaining,
             'progress_percent' => $progressPercent,
+            'estimated_remaining' => $remaining > 0 ? null : 0,
             'current_environment' => $currentEnvironment
                 ? $this->toEnvironmentProgress($currentEnvironment)
                 : null,
+            'phase' => 'images',
         ];
     }
 

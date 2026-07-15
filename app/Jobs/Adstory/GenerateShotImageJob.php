@@ -3,6 +3,7 @@
 namespace App\Jobs\Adstory;
 
 use App\Services\Adstory\AdstoryShotImageJobService;
+use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Foundation\Queue\Queueable;
@@ -11,13 +12,16 @@ use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Log;
 use Throwable;
 
-class GenerateShotImageJob implements ShouldQueue
+class GenerateShotImageJob implements ShouldBeUnique, ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
     public int $tries = 2;
 
     public int $timeout;
+
+    /** Prevent duplicate workers for the same shot while chain/healing runs. */
+    public int $uniqueFor = 600;
 
     public function __construct(
         public int $shotId,
@@ -26,6 +30,11 @@ class GenerateShotImageJob implements ShouldQueue
     ) {
         $this->timeout = AdstoryShotImageJobService::JOB_TIMEOUT_SECONDS;
         $this->onQueue(AdstoryShotImageJobService::QUEUE_NAME);
+    }
+
+    public function uniqueId(): string
+    {
+        return 'adstory-shot-image-'.$this->shotId;
     }
 
     public function handle(AdstoryShotImageJobService $shotImageJobService): void

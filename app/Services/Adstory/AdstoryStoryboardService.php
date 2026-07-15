@@ -404,6 +404,11 @@ class AdstoryStoryboardService
         $stalled = $this->detectShotImageStalledState($shots);
         $currentShot = $this->resolveCurrentStoryboardShot($shots);
 
+        // Auto-heal: queued shots with no active worker / generating shot → start next.
+        if ($queued > 0 && $generating === 0) {
+            $this->shotImageJobService->kickStalledSceneImageChain($scene->id, $project->id);
+        }
+
         return [
             'success' => true,
             'scene' => $this->mapStoryboardSceneDetail($scene),

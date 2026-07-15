@@ -217,6 +217,7 @@ class AdstoryProjectFullLoaderService
             'script' => $project->script,
             'screenplay' => $project->screenplay,
             'visual_style' => $project->visual_style,
+            'cover_image_url' => $project->cover_image_url,
             'current_step' => $project->current_step,
             'status' => $project->status,
             'counts' => $this->sceneboardService->projectCounts($project->id),

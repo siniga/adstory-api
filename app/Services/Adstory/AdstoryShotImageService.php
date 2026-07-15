@@ -12,12 +12,21 @@ use App\Models\AdstoryShot;
 use App\Models\AdstoryShotImage;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Storage;
 use RuntimeException;
 
 class AdstoryShotImageService
 {
+    private const MAX_REFERENCE_IMAGES = 6;
+
     /**
-     * @return array{prompt: string, included: array<string, mixed>}
+     * @return array{
+     *   prompt: string,
+     *   included: array<string, mixed>,
+     *   reference_images: list<array{mimeType: string, data: string, label?: string}>
+     * }
      */
     public function buildShotImagePrompt(
         AdstoryShot $shot,
@@ -26,28 +35,75 @@ class AdstoryShotImageService
         array $characters,
         ?AdstoryEnvironment $environment,
         ?string $customPrompt = null,
+        ?AdstoryShot $previousShot = null,
     ): array {
-        if ($customPrompt !== null && trim($customPrompt) !== '') {
-            return [
-                'prompt' => trim($customPrompt),
-                'included' => ['custom_prompt' => true],
-            ];
-        }
-
-        if (! $this->hasStoryboardSettings($shot) && ! empty($shot->prompt)) {
-            return [
-                'prompt' => trim((string) $shot->prompt),
-                'included' => ['shot_prompt' => true],
-            ];
-        }
-
-        return $this->buildStoryboardAwarePrompt(
+        $package = $this->buildStoryboardAwarePrompt(
             shot: $shot,
             scene: $scene,
             project: $project,
             characters: $characters,
             environment: $environment,
+            previousShot: $previousShot,
         );
+
+        if ($customPrompt !== null && trim($customPrompt) !== '') {
+            $package['prompt'] = trim(
+                $this->buildConsistencyLockHeader($project, $scene, $characters, $environment, $previousShot)
+                ."\n\nUser override shot direction:\n".trim($customPrompt)
+                ."\n\n".$this->buildConsistencyRulesFooter($previousShot !== null)
+            );
+            $package['included']['custom_prompt'] = true;
+        } elseif (! empty($shot->prompt) && ! $this->hasStoryboardSettings($shot)) {
+            // Keep legacy shot prompt as direction, but always wrap with consistency lock.
+            $package['prompt'] = trim(
+                $this->buildConsistencyLockHeader($project, $scene, $characters, $environment, $previousShot)
+                ."\n\nShot direction:\n".trim((string) $shot->prompt)
+                ."\n\n".$this->buildConsistencyRulesFooter($previousShot !== null)
+            );
+            $package['included']['shot_prompt'] = true;
+            $package['included']['consistency_wrapped'] = true;
+        }
+
+        $package['reference_images'] = $this->collectReferenceImages(
+            shot: $shot,
+            project: $project,
+            characters: $characters,
+            environment: $environment,
+            previousShot: $previousShot,
+        );
+        $package['included']['reference_image_count'] = count($package['reference_images']);
+
+        return $package;
+    }
+
+    /**
+     * Previous completed storyboard frame in the same scene (for look continuity).
+     */
+    public function findPreviousCompletedShotInScene(AdstoryShot $shot): ?AdstoryShot
+    {
+        if ($shot->adstory_scene_id === null) {
+            return null;
+        }
+
+        return AdstoryShot::query()
+            ->where('adstory_scene_id', $shot->adstory_scene_id)
+            ->where('adstory_project_id', $shot->adstory_project_id)
+            ->where('id', '!=', $shot->id)
+            ->where('image_status', 'completed')
+            ->whereNotNull('image_url')
+            ->where(function ($query) use ($shot) {
+                $query
+                    ->where('order_index', '<', (int) ($shot->order_index ?? 0))
+                    ->orWhere(function ($inner) use ($shot) {
+                        $inner
+                            ->where('order_index', (int) ($shot->order_index ?? 0))
+                            ->where('shot_number', '<', (int) ($shot->shot_number ?? 0));
+                    });
+            })
+            ->orderByDesc('order_index')
+            ->orderByDesc('shot_number')
+            ->orderByDesc('id')
+            ->first();
     }
 
     public function hasStoryboardSettings(AdstoryShot $shot): bool
@@ -70,6 +126,7 @@ class AdstoryShotImageService
         AdstoryProject $project,
         array $characters,
         ?AdstoryEnvironment $environment,
+        ?AdstoryShot $previousShot = null,
     ): array {
         $included = [
             'composition_preset' => false,
@@ -78,6 +135,8 @@ class AdstoryShotImageService
             'storyboard_settings' => false,
             'character_asset_ids' => [],
             'environment_asset_ids' => [],
+            'previous_shot_id' => $previousShot?->id,
+            'consistency_pack' => true,
         ];
 
         $visualStyle = $project->visual_style ?? 'Cinematic Realistic';
@@ -104,15 +163,12 @@ class AdstoryShotImageService
         if ($this->hasPresetData($compositionPreset)) {
             $included['composition_preset'] = true;
         }
-
         if ($this->hasPresetData($cinematographyPreset)) {
             $included['cinematography_preset'] = true;
         }
-
         if ($this->hasPresetData($lightingPreset)) {
             $included['lighting_preset'] = true;
         }
-
         if ($this->hasPresetData($storyboardSettings)) {
             $included['storyboard_settings'] = true;
         }
@@ -122,7 +178,7 @@ class AdstoryShotImageService
             $sceneVisualStyle = $scene->visual_style ?? $visualStyle;
             $sceneContext = <<<SCENE
 
-Scene context:
+Scene bible (keep consistent for every shot in this scene):
 - Scene title: {$scene->title}
 - Scene description: {$scene->description}
 - Location: {$scene->location}
@@ -142,18 +198,17 @@ SCENE;
                 $characterAssetLines .= "- Character: {$characterName}\n";
                 $characterAssetLines .= "  Asset type: {$asset->asset_type}\n";
                 $characterAssetLines .= "  Title: {$asset->title}\n";
-                if ($asset->image_url) {
-                    $characterAssetLines .= "  Reference image URL: {$asset->image_url}\n";
-                }
             }
         } elseif ($characters !== []) {
             $characterAssetLines = "\nCharacters in shot:\n";
             foreach ($characters as $character) {
                 $appearance = $character->appearance ?? $character->description ?? '';
-                $characterAssetLines .= "- {$character->name}: {$appearance}\n";
-                if ($character->image_url) {
-                    $characterAssetLines .= "  Character reference image: {$character->image_url}\n";
+                $wardrobe = $character->wardrobe ?? '';
+                $characterAssetLines .= "- {$character->name}: {$appearance}";
+                if ($wardrobe !== '') {
+                    $characterAssetLines .= " | Wardrobe: {$wardrobe}";
                 }
+                $characterAssetLines .= "\n";
             }
         } elseif ($shotCharacters !== 'None') {
             $characterAssetLines = "\nCharacters in shot: {$shotCharacters}\n";
@@ -169,9 +224,6 @@ SCENE;
                 $environmentAssetLines .= "- Environment: {$environmentName}\n";
                 $environmentAssetLines .= "  Asset type: {$asset->asset_type}\n";
                 $environmentAssetLines .= "  Title: {$asset->title}\n";
-                if ($asset->image_url) {
-                    $environmentAssetLines .= "  Reference image URL: {$asset->image_url}\n";
-                }
             }
         } elseif ($environment) {
             $environmentAssetLines = <<<ENV
@@ -183,9 +235,6 @@ Environment:
 - Description: {$environment->description}
 - Mood: {$environment->mood}
 ENV;
-            if ($environment->image_url) {
-                $environmentAssetLines .= "- Environment reference image: {$environment->image_url}\n";
-            }
         } elseif ($shotEnvironment !== '') {
             $environmentAssetLines = "\nEnvironment: {$shotEnvironment}\n";
         }
@@ -193,15 +242,12 @@ ENV;
         $compositionSection = $this->hasPresetData($compositionPreset)
             ? "\nSelected composition preset:\n".$this->formatPresetBlock($compositionPreset)
             : '';
-
         $cinematographySection = $this->hasPresetData($cinematographyPreset)
             ? "\nSelected cinematography preset:\n".$this->formatPresetBlock($cinematographyPreset)
             : '';
-
         $lightingSection = $this->hasPresetData($lightingPreset)
             ? "\nSelected lighting preset:\n".$this->formatPresetBlock($lightingPreset)
             : '';
-
         $storyboardSection = $this->hasPresetData($storyboardSettings)
             ? "\nAdditional storyboard settings:\n".$this->formatPresetBlock($storyboardSettings)
             : '';
@@ -209,27 +255,36 @@ ENV;
         $compositionRule = $included['composition_preset']
             ? '- The generated image must match the selected composition preset.'
             : '- Use cinematic composition matching the shot metadata.';
-
         $cinematographyRule = $included['cinematography_preset']
             ? '- The generated image must match the selected cinematography preset.'
             : '';
-
         $lightingRule = $included['lighting_preset']
             ? '- The generated image must match the selected lighting preset.'
             : '';
-
-        $characterRule = $included['character_asset_ids'] !== []
-            ? '- Keep character identity consistent with the selected character references.'
+        $characterRule = $included['character_asset_ids'] !== [] || $characters !== []
+            ? '- Keep character faces, hair, skin tone, age, and wardrobe identical to the reference images / identity bible.'
+            : '';
+        $environmentRule = $included['environment_asset_ids'] !== [] || $environment
+            ? '- Keep environment architecture, props, and lighting direction consistent with the reference images / environment bible.'
+            : '';
+        $previousFrameRule = $previousShot
+            ? '- Continuity: match the attached previous storyboard frame for color grade, texture, lens feel, and character identity. Only change camera framing/action as described for this shot.'
             : '';
 
-        $environmentRule = $included['environment_asset_ids'] !== []
-            ? '- Keep environment consistent with the selected environment references.'
-            : '';
+        $consistencyLock = $this->buildConsistencyLockHeader(
+            $project,
+            $scene,
+            $characters,
+            $environment,
+            $previousShot,
+        );
 
         $prompt = <<<PROMPT
+{$consistencyLock}
+
 Generate a cinematic storyboard frame image for film pre-production.
 
-Project visual style: {$visualStyle}
+Project visual style lock: {$visualStyle}
 
 Shot details:
 - Title: {$title}
@@ -262,11 +317,13 @@ Rules:
 {$lightingRule}
 {$characterRule}
 {$environmentRule}
+{$previousFrameRule}
 - No text overlays.
 - No watermarks.
 - No UI elements.
 - No distorted faces.
 - No extra limbs or duplicated body parts.
+- Do not reinvent character appearance or change the project style mid-storyboard.
 - Match the project visual style, mood, and lighting described above.
 PROMPT;
 
@@ -274,6 +331,277 @@ PROMPT;
             'prompt' => trim($prompt),
             'included' => $included,
         ];
+    }
+
+    /**
+     * @param  array<int, AdstoryCharacter>  $characters
+     */
+    private function buildConsistencyLockHeader(
+        AdstoryProject $project,
+        ?AdstoryScene $scene,
+        array $characters,
+        ?AdstoryEnvironment $environment,
+        ?AdstoryShot $previousShot,
+    ): string {
+        $visualStyle = $project->visual_style ?? 'Cinematic Realistic';
+        $lines = [
+            'CONSISTENCY LOCK (mandatory for this frame):',
+            "- Locked visual style: {$visualStyle}. Keep film stock, color grade, texture, and rendering identical across the storyboard.",
+        ];
+
+        if ($scene) {
+            $lines[] = '- Locked scene setting: '.trim((string) ($scene->location ?: $scene->title));
+            $lines[] = '- Locked time of day / mood: '.trim((string) (($scene->time_of_day ?: '').' / '.($scene->mood ?: 'Neutral')));
+        }
+
+        if ($characters !== []) {
+            $lines[] = '- Character identity bible:';
+            foreach ($characters as $character) {
+                $appearance = trim((string) ($character->appearance ?? $character->description ?? ''));
+                $wardrobe = trim((string) ($character->wardrobe ?? ''));
+                $age = trim((string) ($character->age ?? ''));
+                $gender = trim((string) ($character->gender ?? ''));
+                $parts = array_filter([
+                    $appearance,
+                    $wardrobe !== '' ? "Wardrobe: {$wardrobe}" : '',
+                    $age !== '' ? "Age: {$age}" : '',
+                    $gender !== '' ? "Gender: {$gender}" : '',
+                ]);
+                $detail = trim(implode(' · ', $parts));
+                $lines[] = '  • '.$character->name.($detail !== '' ? ": {$detail}" : '');
+            }
+        }
+
+        if ($environment) {
+            $envDesc = trim((string) ($environment->description ?? ''));
+            $lines[] = '- Environment bible: '.$environment->name
+                .($envDesc !== '' ? " — {$envDesc}" : '')
+                .' · Lighting: '.trim((string) ($environment->lighting ?? $environment->mood ?? 'cinematic'));
+        }
+
+        if ($previousShot) {
+            $lines[] = '- Previous frame continuity: use the attached previous storyboard image as the look / identity anchor.';
+        }
+
+        $lines[] = '- Attached reference images (if present) override text guesses for faces, wardrobe, and location look.';
+
+        return implode("\n", $lines);
+    }
+
+    private function buildConsistencyRulesFooter(bool $hasPreviousFrame): string
+    {
+        $extra = $hasPreviousFrame
+            ? "\n- Match the previous storyboard frame's characters and grade; only change framing/action for this shot."
+            : '';
+
+        return <<<FOOTER
+Consistency rules:
+- Preserve exact character identity and wardrobe across shots.
+- Preserve environment layout and lighting language.
+- Preserve project visual style — do not restyle mid-storyboard.
+- No text overlays, watermarks, or UI.
+{$extra}
+FOOTER;
+    }
+
+    /**
+     * @param  array<int, AdstoryCharacter>  $characters
+     * @return list<array{mimeType: string, data: string, label: string}>
+     */
+    public function collectReferenceImages(
+        AdstoryShot $shot,
+        AdstoryProject $project,
+        array $characters,
+        ?AdstoryEnvironment $environment,
+        ?AdstoryShot $previousShot = null,
+    ): array {
+        $refs = [];
+
+        if ($previousShot) {
+            $inline = $this->loadInlineImage(
+                storagePath: null,
+                imageUrl: $previousShot->image_url,
+                preferredStorageHint: $this->storagePathFromShot($previousShot),
+            );
+            if ($inline !== null) {
+                $refs[] = $inline + ['label' => 'Previous storyboard frame (continuity anchor)'];
+            }
+        }
+
+        $selectedCharacterAssets = $this->resolveSelectedCharacterAssets($shot, $project);
+        if ($selectedCharacterAssets !== []) {
+            foreach ($selectedCharacterAssets as $asset) {
+                if (count($refs) >= self::MAX_REFERENCE_IMAGES) {
+                    break;
+                }
+                $inline = $this->loadInlineImage($asset->storage_path, $asset->image_url);
+                if ($inline !== null) {
+                    $name = $asset->character?->name ?? 'Character';
+                    $refs[] = $inline + ['label' => "Character reference: {$name}"];
+                }
+            }
+        } else {
+            foreach ($characters as $character) {
+                if (count($refs) >= self::MAX_REFERENCE_IMAGES) {
+                    break;
+                }
+                $storagePath = is_array($character->meta ?? null)
+                    ? ($character->meta['image_storage_path'] ?? null)
+                    : null;
+                $inline = $this->loadInlineImage($storagePath, $character->image_url);
+                if ($inline !== null) {
+                    $refs[] = $inline + ['label' => 'Character reference: '.$character->name];
+                }
+            }
+        }
+
+        if (count($refs) < self::MAX_REFERENCE_IMAGES) {
+            $selectedEnvironmentAssets = $this->resolveSelectedEnvironmentAssets($shot, $project);
+            if ($selectedEnvironmentAssets !== []) {
+                foreach ($selectedEnvironmentAssets as $asset) {
+                    if (count($refs) >= self::MAX_REFERENCE_IMAGES) {
+                        break;
+                    }
+                    $inline = $this->loadInlineImage($asset->storage_path, $asset->image_url);
+                    if ($inline !== null) {
+                        $name = $asset->environment?->name ?? 'Environment';
+                        $refs[] = $inline + ['label' => "Environment reference: {$name}"];
+                    }
+                }
+            } elseif ($environment) {
+                $storagePath = is_array($environment->meta ?? null)
+                    ? ($environment->meta['image_storage_path'] ?? null)
+                    : null;
+                $inline = $this->loadInlineImage($storagePath, $environment->image_url);
+                if ($inline !== null) {
+                    $refs[] = $inline + ['label' => 'Environment reference: '.$environment->name];
+                }
+            }
+        }
+
+        return array_values($refs);
+    }
+
+    private function storagePathFromShot(AdstoryShot $shot): ?string
+    {
+        $approved = $shot->relationLoaded('approvedImage')
+            ? $shot->approvedImage
+            : $shot->approvedImage()->first();
+        if ($approved?->storage_path) {
+            return (string) $approved->storage_path;
+        }
+
+        $latest = $shot->shotImages()
+            ->where('status', 'completed')
+            ->orderByDesc('version_number')
+            ->first();
+
+        return $latest?->storage_path ? (string) $latest->storage_path : null;
+    }
+
+    /**
+     * @return array{mimeType: string, data: string}|null
+     */
+    private function loadInlineImage(?string $storagePath, ?string $imageUrl, ?string $preferredStorageHint = null): ?array
+    {
+        $candidates = array_values(array_filter([
+            $preferredStorageHint,
+            $storagePath,
+            $this->guessPublicDiskPathFromUrl($imageUrl),
+        ]));
+
+        foreach ($candidates as $path) {
+            $path = ltrim((string) $path, '/');
+            if ($path === '') {
+                continue;
+            }
+
+            try {
+                if (Storage::disk('public')->exists($path)) {
+                    $bytes = Storage::disk('public')->get($path);
+                    if (is_string($bytes) && $bytes !== '') {
+                        return [
+                            'mimeType' => $this->guessMimeType($path, $bytes),
+                            'data' => base64_encode($bytes),
+                        ];
+                    }
+                }
+            } catch (\Throwable $e) {
+                Log::warning('Failed reading local reference image', [
+                    'path' => $path,
+                    'message' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        $url = trim((string) $imageUrl);
+        if ($url === '' || ! str_starts_with($url, 'http')) {
+            return null;
+        }
+
+        try {
+            $response = Http::timeout(20)->get($url);
+            if (! $response->successful()) {
+                return null;
+            }
+            $bytes = $response->body();
+            if ($bytes === '') {
+                return null;
+            }
+
+            return [
+                'mimeType' => $this->guessMimeType($url, $bytes, $response->header('Content-Type')),
+                'data' => base64_encode($bytes),
+            ];
+        } catch (\Throwable $e) {
+            Log::warning('Failed fetching remote reference image', [
+                'url' => $url,
+                'message' => $e->getMessage(),
+            ]);
+
+            return null;
+        }
+    }
+
+    private function guessPublicDiskPathFromUrl(?string $imageUrl): ?string
+    {
+        $url = trim((string) $imageUrl);
+        if ($url === '') {
+            return null;
+        }
+
+        if (preg_match('#/storage/(.+)$#', $url, $matches) === 1) {
+            return urldecode($matches[1]);
+        }
+
+        return null;
+    }
+
+    private function guessMimeType(string $pathOrUrl, string $bytes, ?string $headerMime = null): string
+    {
+        $headerMime = is_string($headerMime) ? strtolower(trim(explode(';', $headerMime)[0])) : '';
+        if (str_starts_with($headerMime, 'image/')) {
+            return $headerMime;
+        }
+
+        $lower = strtolower($pathOrUrl);
+        if (str_ends_with($lower, '.jpg') || str_ends_with($lower, '.jpeg')) {
+            return 'image/jpeg';
+        }
+        if (str_ends_with($lower, '.webp')) {
+            return 'image/webp';
+        }
+        if (str_ends_with($lower, '.gif')) {
+            return 'image/gif';
+        }
+        if (str_starts_with($bytes, "\xFF\xD8\xFF")) {
+            return 'image/jpeg';
+        }
+        if (str_starts_with($bytes, "\x89PNG")) {
+            return 'image/png';
+        }
+
+        return 'image/png';
     }
 
     /**

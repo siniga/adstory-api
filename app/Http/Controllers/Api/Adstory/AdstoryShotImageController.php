@@ -89,22 +89,15 @@ class AdstoryShotImageController extends Controller
             }
 
             $shots = $query->get();
-            $queued = 0;
-            $skipped = 0;
 
-            Log::info('Adstory generate-shot-images batch: queueing jobs', [
+            Log::info('Adstory generate-shot-images batch: queueing sequential scene chains', [
                 'project_id' => $project->id,
                 'shot_count' => $shots->count(),
                 'force' => $force,
             ]);
 
-            foreach ($shots as $shot) {
-                if ($this->shotImageJobService->queueShotImageJob($shot, force: $force)) {
-                    $queued++;
-                } else {
-                    $skipped++;
-                }
-            }
+            $queued = $this->shotImageJobService->queueShotImageJobsSequential($shots, $force);
+            $skipped = max(0, $shots->count() - $queued);
 
             return response()->json([
                 'success' => true,
@@ -112,7 +105,7 @@ class AdstoryShotImageController extends Controller
                 'skipped' => $skipped,
                 'generated' => 0,
                 'failed' => 0,
-                'message' => "Queued {$queued} shot image job(s).",
+                'message' => "Queued {$queued} shot(s) for sequential scene generation.",
             ], $queued > 0 ? 202 : 200);
         } catch (ValidationException $e) {
             return $this->validationErrorResponse($e);

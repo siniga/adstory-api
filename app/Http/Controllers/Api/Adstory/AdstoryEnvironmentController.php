@@ -35,6 +35,7 @@ class AdstoryEnvironmentController extends Controller
     public function index(AdstoryProject $project): JsonResponse
     {
         $environments = $project->environments()
+            ->with('assets')
             ->orderBy('order_index')
             ->orderBy('id')
             ->get()

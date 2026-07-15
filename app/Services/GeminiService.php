@@ -48,8 +48,14 @@ class GeminiService
         return trim($text);
     }
 
-    public function generateImage(string $prompt, ?string $negativePrompt = null): string
-    {
+    /**
+     * @param  list<array{mimeType: string, data: string}>|null  $referenceImages  Base64-encoded inline images
+     */
+    public function generateImage(
+        string $prompt,
+        ?string $negativePrompt = null,
+        ?array $referenceImages = null,
+    ): string {
         $apiKey = $this->getApiKey();
         $model = config('services.gemini.image_model');
 
@@ -59,15 +65,49 @@ class GeminiService
             $fullPrompt .= "\n\nAvoid generating: ".trim($negativePrompt).'.';
         }
 
+        $parts = [];
+
+        if (is_array($referenceImages) && $referenceImages !== []) {
+            $parts[] = [
+                'text' => "Attached reference images follow. Match character identity, wardrobe, environment look, and visual style to these references.\n\n".$fullPrompt,
+            ];
+
+            foreach ($referenceImages as $index => $image) {
+                $mimeType = trim((string) ($image['mimeType'] ?? ''));
+                $data = trim((string) ($image['data'] ?? ''));
+
+                if ($mimeType === '' || $data === '') {
+                    continue;
+                }
+
+                $label = trim((string) ($image['label'] ?? ''));
+                if ($label !== '') {
+                    $parts[] = ['text' => 'Reference '.($index + 1).': '.$label];
+                }
+
+                $parts[] = [
+                    'inlineData' => [
+                        'mimeType' => $mimeType,
+                        'data' => $data,
+                    ],
+                ];
+            }
+
+            if (count($parts) === 1) {
+                // All refs invalid — fall back to text only.
+                $parts = [['text' => $fullPrompt]];
+            }
+        } else {
+            $parts = [['text' => $fullPrompt]];
+        }
+
         $response = Http::timeout(120)
             ->acceptJson()
             ->post(self::BASE_URL.'/'.$model.':generateContent?key='.$apiKey, [
                 'contents' => [
                     [
                         'role' => 'user',
-                        'parts' => [
-                            ['text' => $fullPrompt],
-                        ],
+                        'parts' => $parts,
                     ],
                 ],
                 'generationConfig' => [
@@ -81,13 +121,13 @@ class GeminiService
             throw new RuntimeException('Gemini image generation failed: '.$message);
         }
 
-        $parts = $response->json('candidates.0.content.parts', []);
+        $responseParts = $response->json('candidates.0.content.parts', []);
 
-        if (! is_array($parts)) {
+        if (! is_array($responseParts)) {
             throw new RuntimeException('Gemini image generation failed: invalid response structure.');
         }
 
-        foreach ($parts as $part) {
+        foreach ($responseParts as $part) {
             if (! empty($part['inlineData']['data'])) {
                 return (string) $part['inlineData']['data'];
             }
